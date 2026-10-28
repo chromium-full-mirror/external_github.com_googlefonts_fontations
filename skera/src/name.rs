@@ -13,6 +13,8 @@ use read_fonts::{
 };
 use write_fonts::FontBuilder;
 
+type FastHashSet<T> = std::collections::HashSet<T, foldhash::fast::FixedState>;
+
 // reference: subset() for name table in harfbuzz
 // https://github.com/harfbuzz/harfbuzz/blob/a070f9ebbe88dc71b248af9731dd49ec93f4e6e6/src/OT/name/name.hh#L387
 impl Subset for Name<'_> {
@@ -26,8 +28,15 @@ impl Subset for Name<'_> {
         let data = self.offset_data().as_bytes();
         data.get(self.name_record_byte_range())
             .ok_or(SubsetTableError(Name::TAG))?;
-        let mut records = Vec::new();
-        let mut retained = std::collections::BTreeSet::new();
+        let overrides = &plan.name_table_overrides;
+        let mut records = Vec::with_capacity(self.count() as usize + overrides.len());
+        let mut overridden = (!overrides.is_empty()).then(|| {
+            FastHashSet::with_capacity_and_hasher(
+                overrides.len(),
+                foldhash::fast::FixedState::default(),
+            )
+        });
+        let storage_offset = self.storage_offset() as usize;
         for record in self.name_record() {
             if !plan.name_ids.contains(record.name_id())
                 || !plan.name_languages.contains(record.language_id())
@@ -44,7 +53,9 @@ impl Subset for Name<'_> {
                 record.language_id(),
                 record.name_id(),
             );
-            let bytes = if let Some(override_bytes) = plan.name_table_overrides.get(&key) {
+            let override_bytes = overridden.as_ref().and_then(|_| overrides.get(&key));
+            let bytes = if let Some(override_bytes) = override_bytes {
+                overridden.as_mut().unwrap().insert(key);
                 if override_bytes.is_empty() {
                     continue;
                 }
@@ -52,19 +63,19 @@ impl Subset for Name<'_> {
             } else if record.length() == 0 {
                 &[]
             } else {
-                let start =
-                    self.storage_offset() as usize + record.string_offset().to_u32() as usize;
+                let start = storage_offset + record.string_offset().to_u32() as usize;
                 data.get(start..start + record.length() as usize)
                     .ok_or(SubsetTableError(Name::TAG))?
             };
             records.push((key, bytes));
-            retained.insert(key);
         }
         // Overrides take precedence over selection filters. Insert missing
         // nonempty records after filtering, just as HarfBuzz's name serializer.
-        for (&key, bytes) in &plan.name_table_overrides {
-            if !bytes.is_empty() && !retained.contains(&key) {
-                records.push((key, bytes.as_slice()));
+        if let Some(overridden) = overridden {
+            for (&key, bytes) in overrides {
+                if !bytes.is_empty() && !overridden.contains(&key) {
+                    records.push((key, bytes.as_slice()));
+                }
             }
         }
         records.sort_unstable_by_key(|(key, bytes)| (*key, bytes.len()));
@@ -72,9 +83,11 @@ impl Subset for Name<'_> {
         let storage_offset = u16::try_from(records.len() * NAME_RECORD_SIZE + 6)
             .map_err(|_| SubsetTableError(Name::TAG))?;
         // HarfBuzz emits format 0; language-tag records are not supported yet.
-        for value in [0, count, storage_offset] {
-            s.embed(value).map_err(|_| SubsetTableError(Name::TAG))?;
-        }
+        let mut header = [0; 6];
+        header[2..4].copy_from_slice(&count.to_be_bytes());
+        header[4..6].copy_from_slice(&storage_offset.to_be_bytes());
+        s.embed_bytes(&header)
+            .map_err(|_| SubsetTableError(Name::TAG))?;
         serialize_name_records(s, &records)
     }
 }
@@ -87,16 +100,20 @@ fn serialize_name_records(
 ) -> Result<(), SubsetError> {
     for &((platform, encoding, language, id), bytes) in records {
         let offset_pos = s.length() + 10;
-        for value in [
+        let values = [
             platform,
             encoding,
             language,
             id.to_u16(),
             bytes.len() as u16,
             0,
-        ] {
-            s.embed(value).map_err(|_| SubsetTableError(Name::TAG))?;
+        ];
+        let mut record = [0; NAME_RECORD_SIZE];
+        for (dst, value) in record.chunks_exact_mut(2).zip(values) {
+            dst.copy_from_slice(&value.to_be_bytes());
         }
+        s.embed_bytes(&record)
+            .map_err(|_| SubsetTableError(Name::TAG))?;
         if bytes.is_empty() {
             continue;
         }

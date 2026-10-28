@@ -361,7 +361,7 @@ pub struct Plan {
     drop_tables: IntSet<Tag>,
     name_ids: IntSet<NameId>,
     name_languages: IntSet<u16>,
-    name_table_overrides: std::collections::BTreeMap<name::RecordKey, Vec<u8>>,
+    name_table_overrides: FastHashMap<name::RecordKey, Vec<u8>>,
     layout_scripts: IntSet<Tag>,
     layout_features: IntSet<Tag>,
 
@@ -475,7 +475,11 @@ impl Plan {
         let bytes = if platform_id == 1 {
             text.as_bytes().to_vec()
         } else {
-            text.encode_utf16().flat_map(u16::to_be_bytes).collect()
+            let mut bytes = Vec::with_capacity(text.len() * 2);
+            for unit in text.encode_utf16() {
+                bytes.extend_from_slice(&unit.to_be_bytes());
+            }
+            bytes
         };
         if bytes.len() > u16::MAX as usize {
             return Err(SubsetError::InvalidNameOverride(
