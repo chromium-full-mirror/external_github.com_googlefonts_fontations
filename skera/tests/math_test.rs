@@ -3,8 +3,8 @@ use skera::{subset_font, Plan, SubsetFlags, DEFAULT_LAYOUT_FEATURES};
 use write_fonts::{
     from_obj::ToOwnedTable,
     read::{collections::IntSet, FontData, FontRead, FontRef, TableProvider},
-    tables::{gsub::*, layout::*, math::*},
-    types::{GlyphId, GlyphId16, Tag},
+    tables::{gdef::Gdef, gsub::*, layout::*, math::*, variations::*},
+    types::{F2Dot14, GlyphId, GlyphId16, Tag},
     FontBuilder,
 };
 
@@ -72,6 +72,10 @@ fn value(value: i16) -> MathValueRecord {
         value.into(),
         Some(Device::new(10, 13, &[-2, -1, 0, 1]).into()),
     )
+}
+
+fn variable_value(value: i16, inner: u16) -> MathValueRecord {
+    MathValueRecord::new(value.into(), Some(VariationIndex::new(1, inner).into()))
 }
 
 fn construction(variant: u16, part: u16) -> MathGlyphConstruction {
@@ -154,6 +158,128 @@ fn synthetic_font() -> Vec<u8> {
         ))
         .unwrap();
     builder.build()
+}
+
+fn variable_math_font() -> Vec<u8> {
+    let bytes = source();
+    let font = FontRef::new(&bytes).unwrap();
+    let mut builder = FontBuilder::new();
+    for record in font.table_directory().table_records() {
+        builder.add_raw(record.tag(), font.data_for_tag(record.tag()).unwrap());
+    }
+
+    let kern = MathKern::new(
+        vec![variable_value(100, 3)],
+        vec![variable_value(-10, 4), variable_value(20, 5)],
+    );
+    let math = Math::new(
+        MathConstants {
+            math_leading: variable_value(12, 0),
+            ..Default::default()
+        },
+        MathGlyphInfo::new(
+            Some(MathItalicsCorrectionInfo::new(
+                coverage(&[2]),
+                vec![variable_value(2, 1)],
+            )),
+            Some(MathTopAccentAttachment::new(
+                coverage(&[2]),
+                vec![variable_value(102, 2)],
+            )),
+            None,
+            Some(MathKernInfo::new(
+                coverage(&[2]),
+                vec![MathKernInfoRecord::new(Some(kern), None, None, None)],
+            )),
+        ),
+        MathVariants::new(
+            10.into(),
+            Some(coverage(&[2])),
+            None,
+            vec![MathGlyphConstruction::new(
+                Some(GlyphAssembly::new(variable_value(30, 6), vec![])),
+                vec![],
+            )],
+            vec![],
+        ),
+    );
+    builder.add_table(&math).unwrap();
+
+    let axis = RegionAxisCoordinates::new(F2Dot14::ZERO, F2Dot14::ONE, F2Dot14::ONE);
+    let regions = VariationRegionList::new(1, vec![VariationRegion::new(vec![axis])]);
+    let data = |values: &[i16]| {
+        ItemVariationData::new(
+            values.len() as u16,
+            1,
+            vec![0],
+            values
+                .iter()
+                .flat_map(|value| value.to_be_bytes())
+                .collect(),
+        )
+    };
+    let mut gdef = Gdef::default();
+    gdef.item_var_store = Some(ItemVariationStore::new(
+        regions,
+        vec![
+            Some(data(&[99])),
+            Some(data(&[10, 11, 12, 13, 14, 15, 16, 17])),
+        ],
+    ))
+    .into();
+    builder.add_table(&gdef).unwrap();
+    builder.build()
+}
+
+fn variation_index(
+    record: &write_fonts::read::tables::math::MathValueRecord,
+    data: FontData,
+) -> u32 {
+    let write_fonts::read::tables::layout::DeviceOrVariationIndex::VariationIndex(index) =
+        record.device(data).unwrap().unwrap()
+    else {
+        panic!("expected variation index")
+    };
+    ((index.delta_set_outer_index() as u32) << 16) | index.delta_set_inner_index() as u32
+}
+
+#[test]
+fn math_variation_indices_are_collected_and_remapped() {
+    let bytes = variable_math_font();
+    let font = FontRef::new(&bytes).unwrap();
+    let bytes = subset_font(
+        &font,
+        &plan(&font, "2", "", SubsetFlags::SUBSET_FLAGS_RETAIN_GIDS),
+    )
+    .unwrap();
+    let font = FontRef::new(&bytes).unwrap();
+
+    let store = font.gdef().unwrap().item_var_store().unwrap().unwrap();
+    assert_eq!(store.item_variation_data_count(), 1);
+    let data = store.item_variation_data().get(0).unwrap().unwrap();
+    assert_eq!(data.item_count(), 7);
+    assert_eq!(data.delta_set(0).collect::<Vec<_>>(), [10]);
+    assert_eq!(data.delta_set(6).collect::<Vec<_>>(), [16]);
+
+    let math = font.math().unwrap();
+    let constants = math.math_constants().unwrap();
+    assert_eq!(
+        variation_index(constants.math_leading(), constants.offset_data()),
+        0
+    );
+    let info = math.math_glyph_info().unwrap();
+    let italics = info.math_italics_correction_info().unwrap().unwrap();
+    assert_eq!(
+        variation_index(&italics.italics_correction()[0], italics.offset_data()),
+        1
+    );
+    let variants = math.math_variants().unwrap();
+    let construction = variants.vert_glyph_constructions().get(0).unwrap();
+    let assembly = construction.glyph_assembly().unwrap().unwrap();
+    assert_eq!(
+        variation_index(assembly.italics_correction(), assembly.offset_data()),
+        6
+    );
 }
 
 #[test]

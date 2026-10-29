@@ -1002,6 +1002,11 @@ impl Plan {
                 );
             }
         }
+        if !self.drop_tables.contains(Math::TAG) {
+            if let Ok(math) = font.math() {
+                math::collect_variation_indices(&math, self, &mut varidx_set);
+            }
+        }
 
         let vardata_count = var_store.item_variation_data_count() as u32;
         remap_variation_indices(
