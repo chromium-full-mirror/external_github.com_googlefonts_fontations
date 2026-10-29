@@ -218,15 +218,17 @@ fn variable_math_font() -> Vec<u8> {
                 .collect(),
         )
     };
-    let mut gdef = Gdef::default();
-    gdef.item_var_store = Some(ItemVariationStore::new(
-        regions,
-        vec![
-            Some(data(&[99])),
-            Some(data(&[10, 11, 12, 13, 14, 15, 16, 17])),
-        ],
-    ))
-    .into();
+    let gdef = Gdef {
+        item_var_store: Some(ItemVariationStore::new(
+            regions,
+            vec![
+                Some(data(&[99])),
+                Some(data(&[10, 11, 12, 13, 14, 15, 16, 17])),
+            ],
+        ))
+        .into(),
+        ..Default::default()
+    };
     builder.add_table(&gdef).unwrap();
     builder.build()
 }
