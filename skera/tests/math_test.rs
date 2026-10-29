@@ -233,6 +233,21 @@ fn variable_math_font() -> Vec<u8> {
     builder.build()
 }
 
+fn variable_math_font_with_gdef(gdef: Option<Gdef>) -> Vec<u8> {
+    let bytes = variable_math_font();
+    let font = FontRef::new(&bytes).unwrap();
+    let mut builder = FontBuilder::new();
+    for record in font.table_directory().table_records() {
+        if record.tag() != Tag::new(b"GDEF") {
+            builder.add_raw(record.tag(), font.data_for_tag(record.tag()).unwrap());
+        }
+    }
+    if let Some(gdef) = gdef {
+        builder.add_table(&gdef).unwrap();
+    }
+    builder.build()
+}
+
 fn variation_index(
     record: &write_fonts::read::tables::math::MathValueRecord,
     data: FontData,
@@ -282,6 +297,50 @@ fn math_variation_indices_are_collected_and_remapped() {
         variation_index(assembly.italics_correction(), assembly.offset_data()),
         6
     );
+}
+
+#[test]
+fn math_is_kept_when_gdef_is_dropped() {
+    let bytes = variable_math_font();
+    let font = FontRef::new(&bytes).unwrap();
+    let plan = Plan::new(
+        &skera::populate_gids("2").unwrap(),
+        &IntSet::empty(),
+        &font,
+        SubsetFlags::SUBSET_FLAGS_RETAIN_GIDS,
+        &[Tag::new(b"GDEF")].into_iter().collect(),
+        &IntSet::all(),
+        &DEFAULT_LAYOUT_FEATURES.iter().copied().collect(),
+        &IntSet::all(),
+        &IntSet::all(),
+    );
+    let bytes = subset_font(&font, &plan).unwrap();
+    let font = FontRef::new(&bytes).unwrap();
+
+    assert!(font.gdef().is_err());
+    assert!(font.math().is_ok());
+}
+
+#[test]
+fn math_drops_unmappable_variation_devices_instead_of_the_table() {
+    for bytes in [
+        variable_math_font_with_gdef(None),
+        variable_math_font_with_gdef(Some(Gdef::default())),
+    ] {
+        let font = FontRef::new(&bytes).unwrap();
+        let bytes = subset_font(
+            &font,
+            &plan(&font, "2", "", SubsetFlags::SUBSET_FLAGS_RETAIN_GIDS),
+        )
+        .unwrap();
+        let font = FontRef::new(&bytes).unwrap();
+        let constants = font.math().unwrap().math_constants().unwrap();
+
+        assert!(constants
+            .math_leading()
+            .device(constants.offset_data())
+            .is_none());
+    }
 }
 
 #[test]

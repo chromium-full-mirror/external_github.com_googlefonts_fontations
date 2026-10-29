@@ -3,7 +3,7 @@
 use crate::{
     offset::{SerializeSerialize, SerializeSubset},
     serialize::{SerializeErrorFlags, Serializer},
-    CollectVariationIndices, Plan, SubsetError, SubsetTable,
+    CollectVariationIndices, Plan, Subset, SubsetError, SubsetTable,
 };
 use read_fonts::{
     collections::IntSet,
@@ -11,6 +11,7 @@ use read_fonts::{
     types::{GlyphId, Offset16},
     ArrayOfOffsets, FontData, FontRef, MinByteRange, ReadError, TableProvider, TopLevelTable,
 };
+use write_fonts::FontBuilder;
 
 type Result<T> = std::result::Result<T, SerializeErrorFlags>;
 
@@ -56,6 +57,8 @@ pub(crate) fn closure(font: &FontRef, glyphs: &mut IntSet<GlyphId>) {
 }
 
 fn read<T>(s: &mut Serializer, result: std::result::Result<T, ReadError>) -> Result<T> {
+    // Unlike HarfBuzz's sanitizer, skera treats malformed required MATH
+    // subtable offsets as a failure instead of replacing them with null.
     result.map_err(|_| s.set_err(SerializeErrorFlags::SERIALIZE_ERROR_READ_ERROR))
 }
 
@@ -66,50 +69,58 @@ fn map_glyph(plan: &Plan, s: &mut Serializer, gid: impl Into<GlyphId>) -> Result
         .ok_or_else(|| s.set_err(SerializeErrorFlags::SERIALIZE_ERROR_INT_OVERFLOW))
 }
 
-// MathValueRecord::copy preserves both hint devices and variation indices.
-// Its device offset is relative to the enclosing table, not the record.
-fn copy_value(
-    record: &MathValueRecord,
-    data: FontData,
-    plan: &Plan,
-    s: &mut Serializer,
-) -> Result<()> {
-    let device = record
-        .device(data)
-        .transpose()
-        .map_err(|_| s.set_err(SerializeErrorFlags::SERIALIZE_ERROR_READ_ERROR))?;
-    let delta = match &device {
-        Some(read_fonts::tables::layout::DeviceOrVariationIndex::VariationIndex(index)) => {
-            let index = ((index.delta_set_outer_index() as u32) << 16)
-                | index.delta_set_inner_index() as u32;
-            plan.layout_varidx_delta_map
-                .get(&index)
-                .map_or(0, |&(_, delta)| delta)
+impl<'a> SubsetTable<'a> for MathValueRecord {
+    type ArgsForSubset = FontData<'a>;
+    type Output = ();
+
+    // MathValueRecord::copy preserves both hint devices and variation indices.
+    // Its device offset is relative to the enclosing table, not the record.
+    fn subset(&self, plan: &Plan, s: &mut Serializer, data: FontData<'a>) -> Result<()> {
+        let device = self
+            .device(data)
+            .transpose()
+            .map_err(|_| s.set_err(SerializeErrorFlags::SERIALIZE_ERROR_READ_ERROR))?;
+        let delta = match &device {
+            Some(read_fonts::tables::layout::DeviceOrVariationIndex::VariationIndex(index)) => {
+                let index = ((index.delta_set_outer_index() as u32) << 16)
+                    | index.delta_set_inner_index() as u32;
+                plan.layout_varidx_delta_map
+                    .get(&index)
+                    .map_or(0, |&(_, delta)| delta)
+            }
+            _ => 0,
+        };
+        let value = i32::from(self.value().to_i16())
+            .checked_add(delta)
+            .and_then(|value| i16::try_from(value).ok())
+            .ok_or_else(|| s.set_err(SerializeErrorFlags::SERIALIZE_ERROR_INT_OVERFLOW))?;
+        s.embed(value)?;
+        let pos = s.embed(0u16)?;
+        if let Some(device) = device {
+            if let Err(err) =
+                Offset16::serialize_subset(&device, s, plan, &plan.layout_varidx_delta_map, pos)
+            {
+                // HarfBuzz keeps the value and emits a null device offset when
+                // a variation index cannot be remapped (including 0xFFFFFFFF).
+                if s.in_error() {
+                    return Err(err);
+                }
+            }
         }
-        _ => 0,
-    };
-    let value = i32::from(record.value().to_i16())
-        .checked_add(delta)
-        .and_then(|value| i16::try_from(value).ok())
-        .ok_or_else(|| s.set_err(SerializeErrorFlags::SERIALIZE_ERROR_INT_OVERFLOW))?;
-    s.embed(value)?;
-    let pos = s.embed(0u16)?;
-    if let Some(device) = device {
-        Offset16::serialize_subset(&device, s, plan, &plan.layout_varidx_delta_map, pos)?;
+        Ok(())
     }
-    Ok(())
 }
 
 impl SubsetTable<'_> for MathConstants<'_> {
     type ArgsForSubset = ();
     type Output = ();
-    fn subset(&self, _plan: &Plan, s: &mut Serializer, _: ()) -> Result<()> {
+    fn subset(&self, plan: &Plan, s: &mut Serializer, _: ()) -> Result<()> {
         // Two signed percentages, two minimum heights, 51 MathValueRecords,
         // and the final percentage. Copy the devices with their parent base.
         s.embed_bytes(&self.min_table_bytes()[..8])?;
         let records: &[MathValueRecord] = read(s, self.offset_data().read_array(8..212))?;
         for record in records {
-            copy_value(record, self.offset_data(), _plan, s)?;
+            record.subset(plan, s, self.offset_data())?;
         }
         s.embed(self.radical_degree_bottom_raise_percent())?;
         Ok(())
@@ -129,7 +140,7 @@ fn copy_math_record_array(
     for (gid, record) in coverage.iter().zip(records) {
         if plan.glyphset_mathed.contains(gid) {
             let gid = map_glyph(plan, s, gid)?;
-            copy_value(record, data, plan, s)?;
+            record.subset(plan, s, data)?;
             retained.push(GlyphId::new(gid as u32));
         }
     }
@@ -180,14 +191,14 @@ impl SubsetTable<'_> for MathTopAccentAttachment<'_> {
 impl SubsetTable<'_> for MathKern<'_> {
     type ArgsForSubset = ();
     type Output = ();
-    fn subset(&self, _plan: &Plan, s: &mut Serializer, _: ()) -> Result<()> {
+    fn subset(&self, plan: &Plan, s: &mut Serializer, _: ()) -> Result<()> {
         let count = self.height_count() as usize;
         if self.correction_height().len() != count || self.kern_values().len() != count + 1 {
             return Err(s.set_err(SerializeErrorFlags::SERIALIZE_ERROR_READ_ERROR));
         }
         s.embed(self.height_count())?;
         for record in self.correction_height().iter().chain(self.kern_values()) {
-            copy_value(record, self.offset_data(), _plan, s)?;
+            record.subset(plan, s, self.offset_data())?;
         }
         Ok(())
     }
@@ -274,7 +285,8 @@ impl SubsetTable<'_> for GlyphAssembly<'_> {
         if self.part_records().len() != self.part_count() as usize {
             return Err(s.set_err(SerializeErrorFlags::SERIALIZE_ERROR_READ_ERROR));
         }
-        copy_value(self.italics_correction(), self.offset_data(), plan, s)?;
+        self.italics_correction()
+            .subset(plan, s, self.offset_data())?;
         s.embed(self.part_count())?;
         for record in self.part_records() {
             let gid = map_glyph(plan, s, record.glyph_id())?;
@@ -373,8 +385,18 @@ impl SubsetTable<'_> for MathVariants<'_> {
         s.embed(self.min_connector_overlap())?;
         let vert_pos = s.embed(0u16)?;
         let horiz_pos = s.embed(0u16)?;
-        s.embed(vertical.len() as u16)?;
-        s.embed(horizontal.len() as u16)?;
+        let vert_count_pos = s.embed(0u16)?;
+        let horiz_count_pos = s.embed(0u16)?;
+        s.check_assign::<u16>(
+            vert_count_pos,
+            vertical.len(),
+            SerializeErrorFlags::SERIALIZE_ERROR_INT_OVERFLOW,
+        )?;
+        s.check_assign::<u16>(
+            horiz_count_pos,
+            horizontal.len(),
+            SerializeErrorFlags::SERIALIZE_ERROR_INT_OVERFLOW,
+        )?;
         serialize_constructions(self.vert_glyph_constructions(), &vert_indices, plan, s)?;
         serialize_constructions(self.horiz_glyph_constructions(), &horiz_indices, plan, s)?;
         if !vertical.is_empty() {
@@ -398,7 +420,7 @@ fn collect_value_indices(
     }
 }
 
-fn collect_covered_values(
+fn collect_covered_value_indices(
     coverage: std::result::Result<CoverageTable, ReadError>,
     records: &[MathValueRecord],
     data: FontData,
@@ -413,128 +435,186 @@ fn collect_covered_values(
     }
 }
 
-fn collect_kern_indices(kern: &MathKern, plan: &Plan, indices: &mut IntSet<u32>) {
-    for record in kern.correction_height().iter().chain(kern.kern_values()) {
-        collect_value_indices(record, kern.offset_data(), plan, indices);
+impl CollectVariationIndices for MathConstants<'_> {
+    fn collect_variation_indices(&self, plan: &Plan, indices: &mut IntSet<u32>) {
+        let Ok(records) = self.offset_data().read_array::<MathValueRecord>(8..212) else {
+            return;
+        };
+        for record in records {
+            collect_value_indices(record, self.offset_data(), plan, indices);
+        }
     }
 }
 
-pub(crate) fn collect_variation_indices(math: &Math, plan: &Plan, indices: &mut IntSet<u32>) {
-    if let Ok(constants) = math.math_constants() {
-        if let Ok(records) = constants
-            .offset_data()
-            .read_array::<MathValueRecord>(8..212)
-        {
-            for record in records {
-                collect_value_indices(record, constants.offset_data(), plan, indices);
-            }
+impl CollectVariationIndices for MathItalicsCorrectionInfo<'_> {
+    fn collect_variation_indices(&self, plan: &Plan, indices: &mut IntSet<u32>) {
+        collect_covered_value_indices(
+            self.coverage(),
+            self.italics_correction(),
+            self.offset_data(),
+            plan,
+            indices,
+        );
+    }
+}
+
+impl CollectVariationIndices for MathTopAccentAttachment<'_> {
+    fn collect_variation_indices(&self, plan: &Plan, indices: &mut IntSet<u32>) {
+        collect_covered_value_indices(
+            self.top_accent_coverage(),
+            self.top_accent_attachment(),
+            self.offset_data(),
+            plan,
+            indices,
+        );
+    }
+}
+
+impl CollectVariationIndices for MathKern<'_> {
+    fn collect_variation_indices(&self, plan: &Plan, indices: &mut IntSet<u32>) {
+        for record in self.correction_height().iter().chain(self.kern_values()) {
+            collect_value_indices(record, self.offset_data(), plan, indices);
         }
     }
+}
 
-    if let Ok(info) = math.math_glyph_info() {
-        if let Some(Ok(italics)) = info.math_italics_correction_info() {
-            collect_covered_values(
-                italics.coverage(),
-                italics.italics_correction(),
-                italics.offset_data(),
-                plan,
-                indices,
-            );
-        }
-        if let Some(Ok(accents)) = info.math_top_accent_attachment() {
-            collect_covered_values(
-                accents.top_accent_coverage(),
-                accents.top_accent_attachment(),
-                accents.offset_data(),
-                plan,
-                indices,
-            );
-        }
-        if let Some(Ok(kern_info)) = info.math_kern_info() {
-            if let Ok(coverage) = kern_info.math_kern_coverage() {
-                for (gid, record) in coverage.iter().zip(kern_info.math_kern_info_records()) {
-                    if !plan.glyphset_mathed.contains(gid) {
-                        continue;
-                    }
-                    for kern in [
-                        record.top_right_math_kern(kern_info.offset_data()),
-                        record.top_left_math_kern(kern_info.offset_data()),
-                        record.bottom_right_math_kern(kern_info.offset_data()),
-                        record.bottom_left_math_kern(kern_info.offset_data()),
-                    ] {
-                        if let Some(Ok(kern)) = kern {
-                            collect_kern_indices(&kern, plan, indices);
-                        }
-                    }
+impl CollectVariationIndices for MathKernInfo<'_> {
+    fn collect_variation_indices(&self, plan: &Plan, indices: &mut IntSet<u32>) {
+        let Ok(coverage) = self.math_kern_coverage() else {
+            return;
+        };
+        for (gid, record) in coverage.iter().zip(self.math_kern_info_records()) {
+            if !plan.glyphset_mathed.contains(gid) {
+                continue;
+            }
+            for kern in [
+                record.top_right_math_kern(self.offset_data()),
+                record.top_left_math_kern(self.offset_data()),
+                record.bottom_right_math_kern(self.offset_data()),
+                record.bottom_left_math_kern(self.offset_data()),
+            ] {
+                if let Some(Ok(kern)) = kern {
+                    kern.collect_variation_indices(plan, indices);
                 }
             }
         }
     }
+}
 
-    let Ok(variants) = math.math_variants() else {
-        return;
-    };
-    for (coverage, constructions) in [
-        (
-            variants.vert_glyph_coverage(),
-            variants.vert_glyph_constructions(),
-        ),
-        (
-            variants.horiz_glyph_coverage(),
-            variants.horiz_glyph_constructions(),
-        ),
-    ] {
-        let Some(Ok(coverage)) = coverage else {
-            continue;
-        };
-        for (gid, construction) in coverage.iter().zip(constructions.iter()) {
-            if !plan.glyphset_cmaped.contains(gid) {
-                continue;
-            }
-            let Ok(construction) = construction else {
+impl CollectVariationIndices for MathGlyphInfo<'_> {
+    fn collect_variation_indices(&self, plan: &Plan, indices: &mut IntSet<u32>) {
+        if let Some(Ok(italics)) = self.math_italics_correction_info() {
+            italics.collect_variation_indices(plan, indices);
+        }
+        if let Some(Ok(accents)) = self.math_top_accent_attachment() {
+            accents.collect_variation_indices(plan, indices);
+        }
+        if let Some(Ok(kern_info)) = self.math_kern_info() {
+            kern_info.collect_variation_indices(plan, indices);
+        }
+    }
+}
+
+impl CollectVariationIndices for GlyphAssembly<'_> {
+    fn collect_variation_indices(&self, plan: &Plan, indices: &mut IntSet<u32>) {
+        collect_value_indices(self.italics_correction(), self.offset_data(), plan, indices);
+    }
+}
+
+impl CollectVariationIndices for MathGlyphConstruction<'_> {
+    fn collect_variation_indices(&self, plan: &Plan, indices: &mut IntSet<u32>) {
+        if let Some(Ok(assembly)) = self.glyph_assembly() {
+            assembly.collect_variation_indices(plan, indices);
+        }
+    }
+}
+
+impl CollectVariationIndices for MathVariants<'_> {
+    fn collect_variation_indices(&self, plan: &Plan, indices: &mut IntSet<u32>) {
+        for (coverage, constructions) in [
+            (self.vert_glyph_coverage(), self.vert_glyph_constructions()),
+            (
+                self.horiz_glyph_coverage(),
+                self.horiz_glyph_constructions(),
+            ),
+        ] {
+            let Some(Ok(coverage)) = coverage else {
                 continue;
             };
-            if let Some(Ok(assembly)) = construction.glyph_assembly() {
-                collect_value_indices(
-                    assembly.italics_correction(),
-                    assembly.offset_data(),
-                    plan,
-                    indices,
-                );
+            for (gid, construction) in coverage.iter().zip(constructions.iter()) {
+                if !plan.glyphset_cmaped.contains(gid) {
+                    continue;
+                }
+                if let Ok(construction) = construction {
+                    construction.collect_variation_indices(plan, indices);
+                }
             }
         }
     }
 }
 
-pub(crate) fn subset(
-    font: &FontRef,
-    plan: &Plan,
-    s: &mut Serializer,
-) -> std::result::Result<(), SubsetError> {
-    let result = (|| {
-        let table = read(s, font.math())?;
-        if table.version().major != 1 {
+impl CollectVariationIndices for Math<'_> {
+    fn collect_variation_indices(&self, plan: &Plan, indices: &mut IntSet<u32>) {
+        if let Ok(constants) = self.math_constants() {
+            constants.collect_variation_indices(plan, indices);
+        }
+        if let Ok(info) = self.math_glyph_info() {
+            info.collect_variation_indices(plan, indices);
+        }
+        if let Ok(variants) = self.math_variants() {
+            variants.collect_variation_indices(plan, indices);
+        }
+    }
+}
+
+impl SubsetTable<'_> for Math<'_> {
+    type ArgsForSubset = ();
+    type Output = ();
+
+    fn subset(&self, plan: &Plan, s: &mut Serializer, _: ()) -> Result<()> {
+        if self.version().major != 1 {
             return Err(s.set_err(SerializeErrorFlags::SERIALIZE_ERROR_READ_ERROR));
         }
-        s.embed(table.version())?;
+        s.embed(self.version())?;
         let constants_pos = s.embed(0u16)?;
         let info_pos = s.embed(0u16)?;
         let variants_pos = s.embed(0u16)?;
-        if !table.math_constants_offset().is_null() {
-            let constants = read(s, table.math_constants())?;
+        if !self.math_constants_offset().is_null() {
+            let constants = read(s, self.math_constants())?;
             Offset16::serialize_subset(&constants, s, plan, (), constants_pos)?;
         }
-        if !table.math_glyph_info_offset().is_null() {
-            let info = read(s, table.math_glyph_info())?;
+        if !self.math_glyph_info_offset().is_null() {
+            let info = read(s, self.math_glyph_info())?;
             Offset16::serialize_subset(&info, s, plan, (), info_pos)?;
         }
-        if !table.math_variants_offset().is_null() {
-            let variants = read(s, table.math_variants())?;
+        if !self.math_variants_offset().is_null() {
+            let variants = read(s, self.math_variants())?;
             Offset16::serialize_subset(&variants, s, plan, (), variants_pos)?;
         }
         Ok(())
-    })();
-    result.map_err(|_| SubsetError::SubsetTableError(Math::TAG))
+    }
+}
+
+impl Subset for Math<'_> {
+    fn subset(
+        &self,
+        plan: &Plan,
+        _font: &FontRef,
+        s: &mut Serializer,
+        _builder: &mut FontBuilder,
+    ) -> std::result::Result<(), SubsetError> {
+        SubsetTable::subset(self, plan, s, ()).map_err(|_| SubsetError::SubsetTableError(Math::TAG))
+    }
+}
+
+#[cfg(test)]
+fn copy_value(
+    record: &MathValueRecord,
+    data: FontData,
+    plan: &Plan,
+    s: &mut Serializer,
+) -> Result<()> {
+    record.subset(plan, s, data)
 }
 
 #[cfg(test)]
@@ -569,5 +649,28 @@ mod tests {
         };
         assert_eq!(index.delta_set_outer_index(), 3);
         assert_eq!(index.delta_set_inner_index(), 4);
+    }
+
+    #[test]
+    fn value_records_drop_unmappable_variation_indices() {
+        for index in [(1, 2), (0xffff, 0xffff)] {
+            let source = write_fonts::dump_table(&OwnedValue::new(
+                10.into(),
+                Some(VariationIndex::new(index.0, index.1).into()),
+            ))
+            .unwrap();
+            let source_data = FontData::new(&source);
+            let value = source_data.read_array::<MathValueRecord>(0..4).unwrap()[0];
+            let mut serializer = Serializer::new(64);
+            serializer.start_serialize().unwrap();
+            copy_value(&value, source_data, &Plan::default(), &mut serializer).unwrap();
+            serializer.end_serialize();
+
+            let bytes = serializer.copy_bytes();
+            let data = FontData::new(&bytes);
+            let value = data.read_array::<MathValueRecord>(0..4).unwrap()[0];
+            assert_eq!(value.value().to_i16(), 10);
+            assert!(value.device(data).is_none());
+        }
     }
 }

@@ -199,6 +199,9 @@ impl<'a> SubsetTable<'a> for VariationIndex<'a> {
         let Some((new_idx, _)) = args.get(&var_idx) else {
             return Err(SerializeErrorFlags::SERIALIZE_ERROR_OTHER);
         };
+        if *new_idx == NO_VARIATION_INDEX {
+            return Err(SerializeErrorFlags::SERIALIZE_ERROR_EMPTY);
+        }
 
         s.embed(*new_idx)?;
         s.embed(self.delta_format()).map(|_| ())

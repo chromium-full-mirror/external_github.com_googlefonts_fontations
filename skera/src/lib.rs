@@ -962,9 +962,6 @@ impl Plan {
     }
 
     fn collect_layout_var_indices(&mut self, font: &FontRef) {
-        if self.drop_tables.contains(Tag::new(b"GDEF")) {
-            return;
-        }
         let Ok(gdef) = font.gdef() else {
             return;
         };
@@ -1004,7 +1001,7 @@ impl Plan {
         }
         if !self.drop_tables.contains(Math::TAG) {
             if let Ok(math) = font.math() {
-                math::collect_variation_indices(&math, self, &mut varidx_set);
+                math.collect_variation_indices(self, &mut varidx_set);
             }
         }
 
@@ -1533,7 +1530,15 @@ fn subset_table<'a>(
     }
 
     match tag {
-        Math::TAG => math::subset(font, plan, s),
+        Math::TAG => Subset::subset(
+            &font
+                .math()
+                .map_err(|_| SubsetError::SubsetTableError(Math::TAG))?,
+            plan,
+            font,
+            s,
+            builder,
+        ),
         Base::TAG => font
             .base()
             .map_err(|_| SubsetError::SubsetTableError(Base::TAG))?
