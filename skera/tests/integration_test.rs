@@ -385,7 +385,7 @@ impl SubsetTestCase {
             args.push(unicodes_option);
         }
 
-        args.push(String::from("--drop-tables+=DSIG,BASE,MATH,CFF,CFF2"));
+        args.push(String::from("--drop-tables+=DSIG,BASE,CFF,CFF2"));
         args.push(String::from("--no-harfbuzz-repacker"));
 
         let mut output_option = String::from("--output-file=");
@@ -459,7 +459,6 @@ fn gen_subset_font_file(font_file: &str, subset: &str, profile: &str, output_fil
 
     //TODO: remove drop_tables once we support those tables
     drop_tables.insert(Tag::new(b"BASE"));
-    drop_tables.insert(Tag::new(b"MATH"));
     drop_tables.insert(Tag::new(b"CFF "));
     drop_tables.insert(Tag::new(b"CFF2"));
 

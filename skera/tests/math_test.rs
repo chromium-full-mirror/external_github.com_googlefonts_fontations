@@ -1,9 +1,16 @@
-//! HarfBuzz references and targeted tests for MATH closure and device bases.
+//! Targeted tests for MATH closure and device bases.
 use skera::{subset_font, Plan, SubsetFlags, DEFAULT_LAYOUT_FEATURES};
 use write_fonts::{
     from_obj::ToOwnedTable,
-    read::{collections::IntSet, FontData, FontRead, FontRef, TableProvider},
-    tables::{gdef::Gdef, gsub::*, layout::*, math::*, variations::*},
+    read::{collections::IntSet, FontData, FontRef, TableProvider},
+    tables::{
+        gdef::Gdef,
+        gpos::{Gpos, PositionLookup, PositionLookupList, SinglePos, ValueRecord},
+        gsub::*,
+        layout::*,
+        math::*,
+        variations::*,
+    },
     types::{F2Dot14, GlyphId, GlyphId16, Tag},
     FontBuilder,
 };
@@ -24,43 +31,6 @@ fn plan(font: &FontRef, gids: &str, unicodes: &str, flags: SubsetFlags) -> Plan 
         &IntSet::all(),
         &IntSet::all(),
     )
-}
-
-#[test]
-fn math_tables_match_harfbuzz() {
-    let bytes = source();
-    let font = FontRef::new(&bytes).unwrap();
-    for (unicodes, count, last_gid) in [
-        ("2f,7c,305", 13, 1430),
-        ("2211,222b,221a,28,29", 47, 4866),
-        ("41,42,1d434", 4, 3301),
-    ] {
-        for retain in [false, true] {
-            let suffix = if retain { "-retain" } else { "" };
-            let reference = std::fs::read(format!(
-                "test-data/expected/math/{}{suffix}.bin",
-                unicodes.replace(',', "-")
-            ))
-            .unwrap();
-            let expected = write_fonts::read::tables::math::Math::read(FontData::new(&reference))
-                .unwrap()
-                .to_owned_table();
-            let flags = SubsetFlags::SUBSET_FLAGS_NOTDEF_OUTLINE
-                | if retain {
-                    SubsetFlags::SUBSET_FLAGS_RETAIN_GIDS
-                } else {
-                    SubsetFlags::default()
-                };
-            let bytes = subset_font(&font, &plan(&font, "", unicodes, flags)).unwrap();
-            let subset = FontRef::new(&bytes).unwrap();
-            let actual: Math = subset.math().unwrap().to_owned_table();
-            assert_eq!(actual, expected, "unicodes={unicodes} retain={retain}");
-            assert_eq!(
-                subset.maxp().unwrap().num_glyphs(),
-                if retain { last_gid } else { count }
-            );
-        }
-    }
 }
 
 fn coverage(gids: &[u16]) -> CoverageTable {
@@ -229,6 +199,28 @@ fn variable_math_font() -> Vec<u8> {
         .into(),
         ..Default::default()
     };
+    // Exercise the shared GDEF store through GPOS as well as MATH.
+    builder
+        .add_table(&Gpos::new(
+            ScriptList::new(vec![ScriptRecord::new(
+                Tag::new(b"DFLT"),
+                Script::new(Some(LangSys::new(vec![0])), vec![]),
+            )]),
+            FeatureList::new(vec![FeatureRecord::new(
+                Tag::new(b"kern"),
+                Feature::new(None, vec![0]),
+            )]),
+            PositionLookupList::new(vec![PositionLookup::Single(Lookup::new(
+                LookupFlag::empty(),
+                vec![SinglePos::format_1(
+                    coverage(&[2]),
+                    ValueRecord::new()
+                        .with_x_advance(40)
+                        .with_x_advance_device(VariationIndex::new(1, 0)),
+                )],
+            ))]),
+        ))
+        .unwrap();
     builder.add_table(&gdef).unwrap();
     builder.build()
 }
@@ -318,7 +310,44 @@ fn math_is_kept_when_gdef_is_dropped() {
     let font = FontRef::new(&bytes).unwrap();
 
     assert!(font.gdef().is_err());
-    assert!(font.math().is_ok());
+    let math = font.math().unwrap();
+    let constants = math.math_constants().unwrap();
+    assert!(constants
+        .math_leading()
+        .device(constants.offset_data())
+        .is_none());
+    let italics = math
+        .math_glyph_info()
+        .unwrap()
+        .math_italics_correction_info()
+        .unwrap()
+        .unwrap();
+    assert!(italics.italics_correction()[0]
+        .device(italics.offset_data())
+        .is_none());
+    let construction = math
+        .math_variants()
+        .unwrap()
+        .vert_glyph_constructions()
+        .get(0)
+        .unwrap();
+    let assembly = construction.glyph_assembly().unwrap().unwrap();
+    assert!(assembly
+        .italics_correction()
+        .device(assembly.offset_data())
+        .is_none());
+    let gpos = font.gpos().unwrap();
+    let lookup = gpos.lookup_list().unwrap().lookups().get(0).unwrap();
+    let write_fonts::read::tables::gpos::PositionLookup::Single(lookup) = lookup else {
+        panic!("expected single positioning")
+    };
+    let write_fonts::read::tables::gpos::SinglePos::Format1(single) =
+        lookup.subtables().get(0).unwrap()
+    else {
+        panic!("expected format 1")
+    };
+    assert_eq!(single.value_record().x_advance(), Some(40));
+    assert!(single.value_record().x_advance_device().is_none());
 }
 
 #[test]

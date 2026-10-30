@@ -1,19 +1,24 @@
 //! MATH closure and subsetting follow HarfBuzz's hb-ot-math-table.hh.
 //! Variants use the cmap closure; per-glyph values use the math closure.
+//! Closure and variation collection skip malformed data; serialization fails on it.
+//! Child subsetting errors propagate because they also set the serializer error;
+//! only unmappable variation devices return an empty result with a null offset.
 use crate::{
+    layout::variation_index,
     offset::{SerializeSerialize, SerializeSubset},
-    serialize::{SerializeErrorFlags, Serializer},
+    serialize::{SerializeErrorFlags, SerializeResultEmpty, Serializer},
     CollectVariationIndices, Plan, Subset, SubsetError, SubsetTable,
 };
 use read_fonts::{
     collections::IntSet,
-    tables::{layout::CoverageTable, math::*},
+    tables::{
+        layout::{CoverageTable, DeviceOrVariationIndex},
+        math::*,
+    },
     types::{GlyphId, Offset16},
     ArrayOfOffsets, FontData, FontRef, MinByteRange, ReadError, TableProvider, TopLevelTable,
 };
 use write_fonts::FontBuilder;
-
-type Result<T> = std::result::Result<T, SerializeErrorFlags>;
 
 pub(crate) fn closure(font: &FontRef, glyphs: &mut IntSet<GlyphId>) {
     let Ok(math) = font.math() else { return };
@@ -56,13 +61,40 @@ pub(crate) fn closure(font: &FontRef, glyphs: &mut IntSet<GlyphId>) {
     glyphs.union(&added);
 }
 
-fn read<T>(s: &mut Serializer, result: std::result::Result<T, ReadError>) -> Result<T> {
+fn read<T>(s: &mut Serializer, result: Result<T, ReadError>) -> Result<T, SerializeErrorFlags> {
     // Unlike HarfBuzz's sanitizer, skera treats malformed required MATH
     // subtable offsets as a failure instead of replacing them with null.
     result.map_err(|_| s.set_err(SerializeErrorFlags::SERIALIZE_ERROR_READ_ERROR))
 }
 
-fn map_glyph(plan: &Plan, s: &mut Serializer, gid: impl Into<GlyphId>) -> Result<u16> {
+fn check_len(
+    s: &mut Serializer,
+    actual: usize,
+    expected: usize,
+) -> Result<(), SerializeErrorFlags> {
+    if actual != expected {
+        return Err(s.set_err(SerializeErrorFlags::SERIALIZE_ERROR_READ_ERROR));
+    }
+    Ok(())
+}
+
+fn kern_corners<'a>(
+    record: &MathKernInfoRecord,
+    data: FontData<'a>,
+) -> [Option<Result<MathKern<'a>, ReadError>>; 4] {
+    [
+        record.top_right_math_kern(data),
+        record.top_left_math_kern(data),
+        record.bottom_right_math_kern(data),
+        record.bottom_left_math_kern(data),
+    ]
+}
+
+fn map_glyph(
+    plan: &Plan,
+    s: &mut Serializer,
+    gid: impl Into<GlyphId>,
+) -> Result<u16, SerializeErrorFlags> {
     plan.glyph_map
         .get(&gid.into())
         .and_then(|g| u16::try_from(g.to_u32()).ok())
@@ -75,15 +107,19 @@ impl<'a> SubsetTable<'a> for MathValueRecord {
 
     // MathValueRecord::copy preserves both hint devices and variation indices.
     // Its device offset is relative to the enclosing table, not the record.
-    fn subset(&self, plan: &Plan, s: &mut Serializer, data: FontData<'a>) -> Result<()> {
+    fn subset(
+        &self,
+        plan: &Plan,
+        s: &mut Serializer,
+        data: FontData<'a>,
+    ) -> Result<(), SerializeErrorFlags> {
         let device = self
             .device(data)
             .transpose()
             .map_err(|_| s.set_err(SerializeErrorFlags::SERIALIZE_ERROR_READ_ERROR))?;
         let delta = match &device {
-            Some(read_fonts::tables::layout::DeviceOrVariationIndex::VariationIndex(index)) => {
-                let index = ((index.delta_set_outer_index() as u32) << 16)
-                    | index.delta_set_inner_index() as u32;
+            Some(DeviceOrVariationIndex::VariationIndex(index)) => {
+                let index = variation_index(index);
                 plan.layout_varidx_delta_map
                     .get(&index)
                     .map_or(0, |&(_, delta)| delta)
@@ -97,15 +133,8 @@ impl<'a> SubsetTable<'a> for MathValueRecord {
         s.embed(value)?;
         let pos = s.embed(0u16)?;
         if let Some(device) = device {
-            if let Err(err) =
-                Offset16::serialize_subset(&device, s, plan, &plan.layout_varidx_delta_map, pos)
-            {
-                // HarfBuzz keeps the value and emits a null device offset when
-                // a variation index cannot be remapped (including 0xFFFFFFFF).
-                if s.in_error() {
-                    return Err(err);
-                }
-            }
+            Offset16::serialize_subset(&device, s, plan, &plan.layout_varidx_delta_map, pos)
+                .is_empty()?;
         }
         Ok(())
     }
@@ -114,11 +143,13 @@ impl<'a> SubsetTable<'a> for MathValueRecord {
 impl SubsetTable<'_> for MathConstants<'_> {
     type ArgsForSubset = ();
     type Output = ();
-    fn subset(&self, plan: &Plan, s: &mut Serializer, _: ()) -> Result<()> {
+    fn subset(&self, plan: &Plan, s: &mut Serializer, _: ()) -> Result<(), SerializeErrorFlags> {
         // Two signed percentages, two minimum heights, 51 MathValueRecords,
         // and the final percentage. Copy the devices with their parent base.
-        s.embed_bytes(&self.min_table_bytes()[..8])?;
-        let records: &[MathValueRecord] = read(s, self.offset_data().read_array(8..212))?;
+        let start = self.math_leading_byte_range().start;
+        let end = self.radical_degree_bottom_raise_percent_byte_range().start;
+        s.embed_bytes(&self.min_table_bytes()[..start])?;
+        let records: &[MathValueRecord] = read(s, self.offset_data().read_array(start..end))?;
         for record in records {
             record.subset(plan, s, self.offset_data())?;
         }
@@ -133,7 +164,7 @@ fn copy_math_record_array(
     data: FontData,
     plan: &Plan,
     s: &mut Serializer,
-) -> Result<()> {
+) -> Result<(), SerializeErrorFlags> {
     let coverage_pos = s.embed(0u16)?;
     let count_pos = s.embed(0u16)?;
     let mut retained = Vec::new();
@@ -155,11 +186,13 @@ fn copy_math_record_array(
 impl SubsetTable<'_> for MathItalicsCorrectionInfo<'_> {
     type ArgsForSubset = ();
     type Output = ();
-    fn subset(&self, plan: &Plan, s: &mut Serializer, _: ()) -> Result<()> {
+    fn subset(&self, plan: &Plan, s: &mut Serializer, _: ()) -> Result<(), SerializeErrorFlags> {
         let coverage = read(s, self.coverage())?;
-        if self.italics_correction().len() != self.italics_correction_count() as usize {
-            return Err(s.set_err(SerializeErrorFlags::SERIALIZE_ERROR_READ_ERROR));
-        }
+        check_len(
+            s,
+            self.italics_correction().len(),
+            self.italics_correction_count() as usize,
+        )?;
         copy_math_record_array(
             &coverage,
             self.italics_correction(),
@@ -173,11 +206,13 @@ impl SubsetTable<'_> for MathItalicsCorrectionInfo<'_> {
 impl SubsetTable<'_> for MathTopAccentAttachment<'_> {
     type ArgsForSubset = ();
     type Output = ();
-    fn subset(&self, plan: &Plan, s: &mut Serializer, _: ()) -> Result<()> {
+    fn subset(&self, plan: &Plan, s: &mut Serializer, _: ()) -> Result<(), SerializeErrorFlags> {
         let coverage = read(s, self.top_accent_coverage())?;
-        if self.top_accent_attachment().len() != self.top_accent_attachment_count() as usize {
-            return Err(s.set_err(SerializeErrorFlags::SERIALIZE_ERROR_READ_ERROR));
-        }
+        check_len(
+            s,
+            self.top_accent_attachment().len(),
+            self.top_accent_attachment_count() as usize,
+        )?;
         copy_math_record_array(
             &coverage,
             self.top_accent_attachment(),
@@ -191,11 +226,10 @@ impl SubsetTable<'_> for MathTopAccentAttachment<'_> {
 impl SubsetTable<'_> for MathKern<'_> {
     type ArgsForSubset = ();
     type Output = ();
-    fn subset(&self, plan: &Plan, s: &mut Serializer, _: ()) -> Result<()> {
+    fn subset(&self, plan: &Plan, s: &mut Serializer, _: ()) -> Result<(), SerializeErrorFlags> {
         let count = self.height_count() as usize;
-        if self.correction_height().len() != count || self.kern_values().len() != count + 1 {
-            return Err(s.set_err(SerializeErrorFlags::SERIALIZE_ERROR_READ_ERROR));
-        }
+        check_len(s, self.correction_height().len(), count)?;
+        check_len(s, self.kern_values().len(), count + 1)?;
         s.embed(self.height_count())?;
         for record in self.correction_height().iter().chain(self.kern_values()) {
             record.subset(plan, s, self.offset_data())?;
@@ -207,11 +241,13 @@ impl SubsetTable<'_> for MathKern<'_> {
 impl SubsetTable<'_> for MathKernInfo<'_> {
     type ArgsForSubset = ();
     type Output = ();
-    fn subset(&self, plan: &Plan, s: &mut Serializer, _: ()) -> Result<()> {
+    fn subset(&self, plan: &Plan, s: &mut Serializer, _: ()) -> Result<(), SerializeErrorFlags> {
         let coverage = read(s, self.math_kern_coverage())?;
-        if self.math_kern_info_records().len() != self.math_kern_count() as usize {
-            return Err(s.set_err(SerializeErrorFlags::SERIALIZE_ERROR_READ_ERROR));
-        }
+        check_len(
+            s,
+            self.math_kern_info_records().len(),
+            self.math_kern_count() as usize,
+        )?;
         let coverage_pos = s.embed(0u16)?;
         let count_pos = s.embed(0u16)?;
         let mut retained = Vec::new();
@@ -220,12 +256,7 @@ impl SubsetTable<'_> for MathKernInfo<'_> {
                 continue;
             }
             retained.push(GlyphId::new(map_glyph(plan, s, gid)? as u32));
-            for kern in [
-                record.top_right_math_kern(self.offset_data()),
-                record.top_left_math_kern(self.offset_data()),
-                record.bottom_right_math_kern(self.offset_data()),
-                record.bottom_left_math_kern(self.offset_data()),
-            ] {
+            for kern in kern_corners(record, self.offset_data()) {
                 let pos = s.embed(0u16)?;
                 if let Some(kern) = kern {
                     let kern = read(s, kern)?;
@@ -245,7 +276,7 @@ impl SubsetTable<'_> for MathKernInfo<'_> {
 impl SubsetTable<'_> for MathGlyphInfo<'_> {
     type ArgsForSubset = ();
     type Output = ();
-    fn subset(&self, plan: &Plan, s: &mut Serializer, _: ()) -> Result<()> {
+    fn subset(&self, plan: &Plan, s: &mut Serializer, _: ()) -> Result<(), SerializeErrorFlags> {
         let italics_pos = s.embed(0u16)?;
         let accent_pos = s.embed(0u16)?;
         let extended_pos = s.embed(0u16)?;
@@ -265,7 +296,7 @@ impl SubsetTable<'_> for MathGlyphInfo<'_> {
                 .take(plan.font_num_glyphs)
                 .filter(|g| plan.glyphset_mathed.contains(*g))
                 .map(|g| map_glyph(plan, s, g).map(|g| GlyphId::new(g as u32)))
-                .collect::<Result<Vec<_>>>()?;
+                .collect::<Result<Vec<_>, _>>()?;
             if !retained.is_empty() {
                 Offset16::serialize_serialize::<CoverageTable>(s, &retained, extended_pos)?;
             }
@@ -281,10 +312,8 @@ impl SubsetTable<'_> for MathGlyphInfo<'_> {
 impl SubsetTable<'_> for GlyphAssembly<'_> {
     type ArgsForSubset = ();
     type Output = ();
-    fn subset(&self, plan: &Plan, s: &mut Serializer, _: ()) -> Result<()> {
-        if self.part_records().len() != self.part_count() as usize {
-            return Err(s.set_err(SerializeErrorFlags::SERIALIZE_ERROR_READ_ERROR));
-        }
+    fn subset(&self, plan: &Plan, s: &mut Serializer, _: ()) -> Result<(), SerializeErrorFlags> {
+        check_len(s, self.part_records().len(), self.part_count() as usize)?;
         self.italics_correction()
             .subset(plan, s, self.offset_data())?;
         s.embed(self.part_count())?;
@@ -303,10 +332,12 @@ impl SubsetTable<'_> for GlyphAssembly<'_> {
 impl SubsetTable<'_> for MathGlyphConstruction<'_> {
     type ArgsForSubset = ();
     type Output = ();
-    fn subset(&self, plan: &Plan, s: &mut Serializer, _: ()) -> Result<()> {
-        if self.math_glyph_variant_records().len() != self.variant_count() as usize {
-            return Err(s.set_err(SerializeErrorFlags::SERIALIZE_ERROR_READ_ERROR));
-        }
+    fn subset(&self, plan: &Plan, s: &mut Serializer, _: ()) -> Result<(), SerializeErrorFlags> {
+        check_len(
+            s,
+            self.math_glyph_variant_records().len(),
+            self.variant_count() as usize,
+        )?;
         let assembly_pos = s.embed(0u16)?;
         if let Some(assembly) = self.glyph_assembly() {
             let assembly = read(s, assembly)?;
@@ -323,11 +354,11 @@ impl SubsetTable<'_> for MathGlyphConstruction<'_> {
 }
 
 fn collect_coverage_and_indices(
-    coverage: Option<std::result::Result<CoverageTable, ReadError>>,
+    coverage: Option<Result<CoverageTable, ReadError>>,
     count: usize,
     plan: &Plan,
     s: &mut Serializer,
-) -> Result<(Vec<GlyphId>, Vec<usize>)> {
+) -> Result<(Vec<GlyphId>, Vec<usize>), SerializeErrorFlags> {
     let mut retained = Vec::new();
     let mut indices = Vec::new();
     if let Some(coverage) = coverage {
@@ -347,7 +378,7 @@ fn serialize_constructions<'a>(
     indices: &[usize],
     plan: &Plan,
     s: &mut Serializer,
-) -> Result<()> {
+) -> Result<(), SerializeErrorFlags> {
     for &index in indices {
         let pos = s.embed(0u16)?;
         match constructions.get(index) {
@@ -364,7 +395,17 @@ fn serialize_constructions<'a>(
 impl SubsetTable<'_> for MathVariants<'_> {
     type ArgsForSubset = ();
     type Output = ();
-    fn subset(&self, plan: &Plan, s: &mut Serializer, _: ()) -> Result<()> {
+    fn subset(&self, plan: &Plan, s: &mut Serializer, _: ()) -> Result<(), SerializeErrorFlags> {
+        check_len(
+            s,
+            self.vert_glyph_construction_offsets().len(),
+            self.vert_glyph_count() as usize,
+        )?;
+        check_len(
+            s,
+            self.horiz_glyph_construction_offsets().len(),
+            self.horiz_glyph_count() as usize,
+        )?;
         let (vertical, vert_indices) = collect_coverage_and_indices(
             self.vert_glyph_coverage(),
             self.vert_glyph_count() as usize,
@@ -377,11 +418,6 @@ impl SubsetTable<'_> for MathVariants<'_> {
             plan,
             s,
         )?;
-        if self.vert_glyph_construction_offsets().len() != self.vert_glyph_count() as usize
-            || self.horiz_glyph_construction_offsets().len() != self.horiz_glyph_count() as usize
-        {
-            return Err(s.set_err(SerializeErrorFlags::SERIALIZE_ERROR_READ_ERROR));
-        }
         s.embed(self.min_connector_overlap())?;
         let vert_pos = s.embed(0u16)?;
         let horiz_pos = s.embed(0u16)?;
@@ -421,7 +457,7 @@ fn collect_value_indices(
 }
 
 fn collect_covered_value_indices(
-    coverage: std::result::Result<CoverageTable, ReadError>,
+    coverage: Result<CoverageTable, ReadError>,
     records: &[MathValueRecord],
     data: FontData,
     plan: &Plan,
@@ -437,7 +473,9 @@ fn collect_covered_value_indices(
 
 impl CollectVariationIndices for MathConstants<'_> {
     fn collect_variation_indices(&self, plan: &Plan, indices: &mut IntSet<u32>) {
-        let Ok(records) = self.offset_data().read_array::<MathValueRecord>(8..212) else {
+        let start = self.math_leading_byte_range().start;
+        let end = self.radical_degree_bottom_raise_percent_byte_range().start;
+        let Ok(records) = self.offset_data().read_array::<MathValueRecord>(start..end) else {
             return;
         };
         for record in records {
@@ -487,12 +525,7 @@ impl CollectVariationIndices for MathKernInfo<'_> {
             if !plan.glyphset_mathed.contains(gid) {
                 continue;
             }
-            for kern in [
-                record.top_right_math_kern(self.offset_data()),
-                record.top_left_math_kern(self.offset_data()),
-                record.bottom_right_math_kern(self.offset_data()),
-                record.bottom_left_math_kern(self.offset_data()),
-            ] {
+            for kern in kern_corners(record, self.offset_data()) {
                 if let Some(Ok(kern)) = kern {
                     kern.collect_variation_indices(plan, indices);
                 }
@@ -567,34 +600,6 @@ impl CollectVariationIndices for Math<'_> {
     }
 }
 
-impl SubsetTable<'_> for Math<'_> {
-    type ArgsForSubset = ();
-    type Output = ();
-
-    fn subset(&self, plan: &Plan, s: &mut Serializer, _: ()) -> Result<()> {
-        if self.version().major != 1 {
-            return Err(s.set_err(SerializeErrorFlags::SERIALIZE_ERROR_READ_ERROR));
-        }
-        s.embed(self.version())?;
-        let constants_pos = s.embed(0u16)?;
-        let info_pos = s.embed(0u16)?;
-        let variants_pos = s.embed(0u16)?;
-        if !self.math_constants_offset().is_null() {
-            let constants = read(s, self.math_constants())?;
-            Offset16::serialize_subset(&constants, s, plan, (), constants_pos)?;
-        }
-        if !self.math_glyph_info_offset().is_null() {
-            let info = read(s, self.math_glyph_info())?;
-            Offset16::serialize_subset(&info, s, plan, (), info_pos)?;
-        }
-        if !self.math_variants_offset().is_null() {
-            let variants = read(s, self.math_variants())?;
-            Offset16::serialize_subset(&variants, s, plan, (), variants_pos)?;
-        }
-        Ok(())
-    }
-}
-
 impl Subset for Math<'_> {
     fn subset(
         &self,
@@ -602,19 +607,31 @@ impl Subset for Math<'_> {
         _font: &FontRef,
         s: &mut Serializer,
         _builder: &mut FontBuilder,
-    ) -> std::result::Result<(), SubsetError> {
-        SubsetTable::subset(self, plan, s, ()).map_err(|_| SubsetError::SubsetTableError(Math::TAG))
+    ) -> Result<(), SubsetError> {
+        let mut subset = || -> Result<(), SerializeErrorFlags> {
+            if self.version().major != 1 {
+                return Err(s.set_err(SerializeErrorFlags::SERIALIZE_ERROR_READ_ERROR));
+            }
+            s.embed(self.version())?;
+            let constants_pos = s.embed(0u16)?;
+            let info_pos = s.embed(0u16)?;
+            let variants_pos = s.embed(0u16)?;
+            if !self.math_constants_offset().is_null() {
+                let constants = read(s, self.math_constants())?;
+                Offset16::serialize_subset(&constants, s, plan, (), constants_pos)?;
+            }
+            if !self.math_glyph_info_offset().is_null() {
+                let info = read(s, self.math_glyph_info())?;
+                Offset16::serialize_subset(&info, s, plan, (), info_pos)?;
+            }
+            if !self.math_variants_offset().is_null() {
+                let variants = read(s, self.math_variants())?;
+                Offset16::serialize_subset(&variants, s, plan, (), variants_pos)?;
+            }
+            Ok(())
+        };
+        subset().map_err(|_| SubsetError::SubsetTableError(Math::TAG))
     }
-}
-
-#[cfg(test)]
-fn copy_value(
-    record: &MathValueRecord,
-    data: FontData,
-    plan: &Plan,
-    s: &mut Serializer,
-) -> Result<()> {
-    record.subset(plan, s, data)
 }
 
 #[cfg(test)]
@@ -635,15 +652,14 @@ mod tests {
         plan.layout_varidx_delta_map.insert(0x10002, (0x30004, 5));
         let mut serializer = Serializer::new(64);
         serializer.start_serialize().unwrap();
-        copy_value(&value, FontData::new(&source), &plan, &mut serializer).unwrap();
+        value.subset(&plan, &mut serializer, source_data).unwrap();
         serializer.end_serialize();
 
         let bytes = serializer.copy_bytes();
         let data = FontData::new(&bytes);
         let value = data.read_array::<MathValueRecord>(0..4).unwrap()[0];
         assert_eq!(value.value().to_i16(), 15);
-        let read_fonts::tables::layout::DeviceOrVariationIndex::VariationIndex(index) =
-            value.device(data).unwrap().unwrap()
+        let DeviceOrVariationIndex::VariationIndex(index) = value.device(data).unwrap().unwrap()
         else {
             panic!("expected variation index")
         };
@@ -653,7 +669,11 @@ mod tests {
 
     #[test]
     fn value_records_drop_unmappable_variation_indices() {
-        for index in [(1, 2), (0xffff, 0xffff)] {
+        for (index, mapped, expected_value) in [
+            ((1, 2), None, 10),
+            ((0xffff, 0xffff), None, 10),
+            ((1, 2), Some((0xffffffff, 5)), 15),
+        ] {
             let source = write_fonts::dump_table(&OwnedValue::new(
                 10.into(),
                 Some(VariationIndex::new(index.0, index.1).into()),
@@ -661,15 +681,19 @@ mod tests {
             .unwrap();
             let source_data = FontData::new(&source);
             let value = source_data.read_array::<MathValueRecord>(0..4).unwrap()[0];
+            let mut plan = Plan::default();
+            if let Some(mapped) = mapped {
+                plan.layout_varidx_delta_map.insert(0x10002, mapped);
+            }
             let mut serializer = Serializer::new(64);
             serializer.start_serialize().unwrap();
-            copy_value(&value, source_data, &Plan::default(), &mut serializer).unwrap();
+            value.subset(&plan, &mut serializer, source_data).unwrap();
             serializer.end_serialize();
 
             let bytes = serializer.copy_bytes();
             let data = FontData::new(&bytes);
             let value = data.read_array::<MathValueRecord>(0..4).unwrap()[0];
-            assert_eq!(value.value().to_i16(), 10);
+            assert_eq!(value.value().to_i16(), expected_value);
             assert!(value.device(data).is_none());
         }
     }

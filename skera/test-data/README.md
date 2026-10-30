@@ -15,7 +15,3 @@ Describes the provenance, usage and generation procedures for font data used for
     ```
 
 [OFL]: https://scripts.sil.org/cms/scripts/page.php?site_id=nrsi&id=OFL
-The `expected/math/*.bin` references are MATH tables extracted from HarfBuzz
-subsets of `STIXTwoMath-Regular.ttf`, with the Unicode selections and retain-GID
-modes in `tests/math_test.rs`, using `--notdef-outline --name-IDs=*`. They retain
-the source fixture's license.
