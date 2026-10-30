@@ -392,11 +392,15 @@ impl<'s> Recorder<'s> {
     }
 }
 
+pub(super) fn operand_stack<F: CffFlavor>() -> Vec<Value> {
+    Vec::with_capacity(F::STACK_LIMIT.min(48))
+}
+
 pub(super) struct Interpreter<'a, 's, F, S, A> {
     source: &'s S,
     actions: &'a mut A,
     fd: usize,
-    stack: Vec<Value>,
+    stack: &'a mut Vec<Value>,
     transient: Vec<Value>,
     hints: usize,
     ivs: usize,
@@ -412,13 +416,21 @@ pub(super) struct Interpreter<'a, 's, F, S, A> {
 impl<'a, 's, F: CffFlavor, S: CharStringSource, A: CharStringActions<'s>>
     Interpreter<'a, 's, F, S, A>
 {
-    pub fn new(source: &'s S, actions: &'a mut A, fd: usize, ivs: usize, drop_hints: bool) -> Self {
+    pub fn new(
+        source: &'s S,
+        actions: &'a mut A,
+        fd: usize,
+        ivs: usize,
+        drop_hints: bool,
+        stack: &'a mut Vec<Value>,
+    ) -> Self {
         debug_assert!(u32::try_from(fd).is_ok());
+        stack.clear();
         Self {
             source,
             actions,
             fd,
-            stack: vec![],
+            stack,
             transient: vec![Value::default(); 32],
             hints: 0,
             ivs,
@@ -617,9 +629,9 @@ impl<'a, 's, F: CffFlavor, S: CharStringSource, A: CharStringActions<'s>>
                     }
                     let hint = matches!(op, 1 | 3 | 18 | 19 | 20 | 23);
                     if hint && self.drop_hints {
-                        self.actions.hint(key, start, p, &self.stack);
+                        self.actions.hint(key, start, p, self.stack);
                     } else if !(F::CFF2 && op == 14) {
-                        self.actions.command(op, &self.stack, mask);
+                        self.actions.command(op, self.stack, mask);
                     }
                     self.stack.clear();
                     if op == 14 {
@@ -827,14 +839,21 @@ mod tests {
         }
         data.extend([149, 1, 139, 139, 21, 14]);
         let mut rec = Recorder::default();
-        Interpreter::<Cff1, _, _>::new(&source, &mut rec, 0, 0, true)
+        Interpreter::<Cff1, _, _>::new(&source, &mut rec, 0, 0, true, &mut operand_stack::<Cff1>())
             .run(Program::Glyph(0), &data)
             .unwrap();
         assert!(rec.needs_flatten);
         let mut flat = Flattener::default();
-        Interpreter::<Cff1, _, _>::new(&source, &mut flat, 0, 0, true)
-            .run(Program::Glyph(0), &data)
-            .unwrap();
+        Interpreter::<Cff1, _, _>::new(
+            &source,
+            &mut flat,
+            0,
+            0,
+            true,
+            &mut operand_stack::<Cff1>(),
+        )
+        .run(Program::Glyph(0), &data)
+        .unwrap();
         assert_eq!(
             flatten(&flat.commands, None, false, 0).unwrap(),
             [139, 139, 21, 14]
@@ -847,9 +866,16 @@ mod tests {
         let source = Source(vec![vec![139, 149, 11]]);
         fn record<'s>(source: &'s Source, glyph: &'s [u8], gid: u32) -> Recorder<'s> {
             let mut rec = Recorder::default();
-            Interpreter::<Cff1, _, _>::new(source, &mut rec, 0, 0, true)
-                .run(Program::Glyph(gid), glyph)
-                .unwrap();
+            Interpreter::<Cff1, _, _>::new(
+                source,
+                &mut rec,
+                0,
+                0,
+                true,
+                &mut operand_stack::<Cff1>(),
+            )
+            .run(Program::Glyph(gid), glyph)
+            .unwrap();
             rec
         }
         let mut merged = Recorder::default();
@@ -877,7 +903,7 @@ mod tests {
     fn hints_with_local_literals_remain_subroutinized() {
         let source = Source(vec![vec![139, 149, 1, 11]]);
         let mut rec = Recorder::default();
-        Interpreter::<Cff1, _, _>::new(&source, &mut rec, 0, 0, true)
+        Interpreter::<Cff1, _, _>::new(&source, &mut rec, 0, 0, true, &mut operand_stack::<Cff1>())
             .run(Program::Glyph(0), &[32, 10, 139, 139, 21, 14])
             .unwrap();
         assert!(!rec.needs_flatten);
@@ -896,20 +922,32 @@ mod tests {
     fn caller_supplied_subroutine_operand_is_rejected() {
         let source = Source(vec![vec![10, 11]]);
         let mut rec = Recorder::default();
-        assert!(
-            Interpreter::<Cff1, _, _>::new(&source, &mut rec, 0, 0, false)
-                .run(Program::Glyph(0), &[32, 32, 10, 14])
-                .is_err()
-        );
+        assert!(Interpreter::<Cff1, _, _>::new(
+            &source,
+            &mut rec,
+            0,
+            0,
+            false,
+            &mut operand_stack::<Cff1>()
+        )
+        .run(Program::Glyph(0), &[32, 32, 10, 14])
+        .is_err());
     }
     #[test]
     fn flatten_keeps_blend_groups() {
         let source = Source(vec![]);
         let mut flat = Flattener::default();
         let data = [139, 149, 140, 141, 141, 16, 21];
-        Interpreter::<Cff2, _, _>::new(&source, &mut flat, 0, 0, false)
-            .run(Program::Glyph(0), &data)
-            .unwrap();
+        Interpreter::<Cff2, _, _>::new(
+            &source,
+            &mut flat,
+            0,
+            0,
+            false,
+            &mut operand_stack::<Cff2>(),
+        )
+        .run(Program::Glyph(0), &data)
+        .unwrap();
         assert_eq!(flatten(&flat.commands, None, true, 0).unwrap(), data);
     }
     #[test]
@@ -922,11 +960,36 @@ mod tests {
             vec![139, 19],
             vec![32, 10],
         ] {
-            assert!(
-                Interpreter::<Cff1, _, _>::new(&source, &mut (), 0, 0, false)
-                    .run(Program::Glyph(0), &bytes)
-                    .is_err()
-            );
+            assert!(Interpreter::<Cff1, _, _>::new(
+                &source,
+                &mut (),
+                0,
+                0,
+                false,
+                &mut operand_stack::<Cff1>()
+            )
+            .run(Program::Glyph(0), &bytes)
+            .is_err());
         }
+    }
+
+    #[test]
+    fn borrowed_stack_survives_an_interpreter_error() {
+        let source = Source(vec![]);
+        let mut stack = operand_stack::<Cff1>();
+        let buffer = stack.as_ptr();
+        let mut actions = ();
+        assert!(
+            Interpreter::<Cff1, _, _>::new(&source, &mut actions, 0, 0, false, &mut stack)
+                .run(Program::Glyph(0), &[139, 10])
+                .is_err()
+        );
+        let mut interp =
+            Interpreter::<Cff1, _, _>::new(&source, &mut actions, 0, 0, false, &mut stack);
+        interp
+            .run(Program::Glyph(1), &[139, 139, 204, 205, 14])
+            .unwrap();
+        assert_eq!(interp.seac, Some((65, 66)));
+        assert_eq!(stack.as_ptr(), buffer);
     }
 }
