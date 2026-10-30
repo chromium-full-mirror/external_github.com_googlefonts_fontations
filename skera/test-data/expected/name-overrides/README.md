@@ -17,7 +17,7 @@ in order through `hb_subset_input_override_name_table`:
 | 300 | 3 | 1 | 0x0410 | `Nome finale` |
 | 301 | 0 | 4 | 0 | `Embedded\0NUL` (12 UTF-8 bytes, with a literal NUL) |
 
-The test compares record keys and encoded strings, independently of string
-storage offsets. This covers surrogate pairs, embedded NULs, repeated
+The test compares the raw table bytes as well as record keys and encoded
+strings. This covers surrogate pairs, embedded NULs, repeated
 requests, removals, and insertion despite name, language, and platform
 selection filters.

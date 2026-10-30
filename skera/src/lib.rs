@@ -472,20 +472,26 @@ impl Plan {
                 "Macintosh overrides require ASCII text".into(),
             ));
         }
+        let len = if platform_id == 1 {
+            text.len()
+        } else {
+            // Stop counting once the encoded name is too long to store.
+            text.encode_utf16().take(u16::MAX as usize / 2 + 1).count() * 2
+        };
+        if len > u16::MAX as usize {
+            return Err(SubsetError::InvalidNameOverride(
+                "encoded name exceeds 65535 bytes".into(),
+            ));
+        }
         let bytes = if platform_id == 1 {
             text.as_bytes().to_vec()
         } else {
-            let mut bytes = Vec::with_capacity(text.len() * 2);
+            let mut bytes = Vec::with_capacity(len);
             for unit in text.encode_utf16() {
                 bytes.extend_from_slice(&unit.to_be_bytes());
             }
             bytes
         };
-        if bytes.len() > u16::MAX as usize {
-            return Err(SubsetError::InvalidNameOverride(
-                "encoded name exceeds 65535 bytes".into(),
-            ));
-        }
         self.name_table_overrides
             .insert((platform_id, encoding_id, language_id, name_id), bytes);
         Ok(())

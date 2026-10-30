@@ -2,7 +2,7 @@
 use skera::{subset_font, Plan, SubsetError, SubsetFlags, DEFAULT_LAYOUT_FEATURES};
 use write_fonts::read::{
     collections::IntSet, tables::name::Name, types::NameId, types::Tag, FontData, FontRead,
-    FontRef, TableProvider,
+    FontRef, TableProvider, TopLevelTable,
 };
 
 const FONT: &[u8] = include_bytes!("../test-data/fonts/Roboto-Regular.ttf");
@@ -69,10 +69,12 @@ fn replacements_insertions_and_removals_match_harfbuzz() {
     let out = subset_font(&font, &plan).unwrap();
     let out = FontRef::new(&out).unwrap();
     let name = out.name().unwrap();
-    let expected = Name::read(FontData::new(include_bytes!(
-        "../test-data/expected/name-overrides/name.bin"
-    )))
-    .unwrap();
+    let expected_bytes = include_bytes!("../test-data/expected/name-overrides/name.bin");
+    assert_eq!(
+        out.data_for_tag(Name::TAG).unwrap().as_bytes(),
+        expected_bytes
+    );
+    let expected = Name::read(FontData::new(expected_bytes)).unwrap();
     assert_eq!(records(&name), records(&expected));
     let actual = records(&name);
     for key in [(3, 1, 0x409, 4), (3, 1, 0x409, 5)] {
@@ -102,13 +104,25 @@ fn rejected_overrides_preserve_previous_requests_and_large_names_fit() {
         plan.override_name_table(NameId::new(1), 1, 0, 0, Some("Café")),
         Err(SubsetError::InvalidNameOverride(_))
     ));
-    let large = "x".repeat(32767);
-    plan.override_name_table(NameId::new(1), 3, 1, 0x409, Some(&large))
-        .unwrap();
     assert!(matches!(
-        plan.override_name_table(NameId::new(1), 3, 1, 0x409, Some(&"x".repeat(32768))),
+        plan.override_name_table(NameId::new(1), 1, 0, 0, Some(&"x".repeat(65536))),
         Err(SubsetError::InvalidNameOverride(_))
     ));
+    // The encoded length limit applies to UTF-16BE, not UTF-8.
+    let large = "中".repeat(32767);
+    plan.override_name_table(NameId::new(1), 3, 1, 0x409, Some(&large))
+        .unwrap();
+    for oversized in [
+        "x".repeat(32768),
+        "é".repeat(32768),
+        "中".repeat(32768),
+        "😀".repeat(16384),
+    ] {
+        assert!(matches!(
+            plan.override_name_table(NameId::new(1), 3, 1, 0x409, Some(&oversized)),
+            Err(SubsetError::InvalidNameOverride(_))
+        ));
+    }
     let out = subset_font(&font, &plan).unwrap();
     let out = FontRef::new(&out).unwrap();
     let actual = records(&out.name().unwrap());

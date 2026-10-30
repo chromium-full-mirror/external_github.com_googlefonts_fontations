@@ -16,7 +16,7 @@ use write_fonts::FontBuilder;
 type FastHashSet<T> = std::collections::HashSet<T, foldhash::fast::FixedState>;
 
 // reference: subset() for name table in harfbuzz
-// https://github.com/harfbuzz/harfbuzz/blob/a070f9ebbe88dc71b248af9731dd49ec93f4e6e6/src/OT/name/name.hh#L387
+// https://github.com/harfbuzz/harfbuzz/blob/d659591a6d7709f65bdfd0f002397c6056ef4bf6/src/OT/name/name.hh#L387
 impl Subset for Name<'_> {
     fn subset(
         &self,
@@ -54,8 +54,10 @@ impl Subset for Name<'_> {
                 record.name_id(),
             );
             let override_bytes = overridden.as_ref().and_then(|_| overrides.get(&key));
-            let bytes = if let Some(override_bytes) = override_bytes {
-                overridden.as_mut().unwrap().insert(key);
+            let bytes = if let (Some(overridden), Some(override_bytes)) =
+                (overridden.as_mut(), override_bytes)
+            {
+                overridden.insert(key);
                 if override_bytes.is_empty() {
                     continue;
                 }

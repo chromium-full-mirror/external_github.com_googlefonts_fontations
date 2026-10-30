@@ -9,7 +9,6 @@ Unicode range bits. CLI list operations then tailor those selections in command
 line order, while boolean flags and custom glyph mappings add to the preset.
 Tables are still subset and can be optimized or re-encoded.
 
-`--no-bidi-closure` omits mirrored Unicode variants from the subset.
 Use `--name-IDs` and `--name-languages` to select naming records;
 `--name-legacy` also keeps records for non-Unicode platforms.
 The library's `Plan::override_name_table` replaces or inserts individual
